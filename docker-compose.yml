@@ -1,6 +1,10 @@
 services:
 
   app:
+    # Construit l'image à partir du Dockerfile et la tague "workshop-organizer"
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: workshop-organizer
     ports:
       - "8080:8080"
@@ -8,6 +12,19 @@ services:
       SPRING_DATASOURCE_URL: "jdbc:postgresql://db:5432/workshopsdb"
       SPRING_DATASOURCE_USERNAME: workshops_user
       SPRING_DATASOURCE_PASSWORD: oc2024
+    # L'application n'est démarrée qu'une fois PostgreSQL réellement prêt
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Vérifie que le port HTTP de l'API répond (sans dépendance externe :
+      # /dev/tcp est une fonctionnalité de bash, présent dans l'image Temurin)
+      test: ["CMD-SHELL", "bash -c ': > /dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
 
   db:
     image: postgres:13
@@ -15,3 +32,16 @@ services:
       POSTGRES_USER: workshops_user
       POSTGRES_PASSWORD: oc2024
       POSTGRES_DB: workshopsdb
+    # Volume nommé pour la persistance des données PostgreSQL
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workshops_user -d workshopsdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

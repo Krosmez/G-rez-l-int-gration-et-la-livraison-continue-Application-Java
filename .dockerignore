@@ -1,0 +1,17 @@
+# Build artifacts & caches (rebuilt inside the image)
+build/
+.gradle/
+
+# Version control & IDE
+.git/
+.gitignore
+.idea/
+*.iml
+
+# Docker / k8s tooling (not needed at build time)
+docker-compose.yml
+k8s/
+
+# Misc
+HELP.md
+README.md
