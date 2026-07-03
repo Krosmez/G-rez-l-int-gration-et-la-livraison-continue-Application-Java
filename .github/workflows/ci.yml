@@ -312,23 +312,101 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configurer Node.js
+      # --- Détection du type de projet (même logique que les autres jobs) ----
+      # semantic-release est un outil Node, mais le DÉPÔT versionné peut être
+      # Node (Angular) ou non (Java/Gradle). On adapte la configuration Node en
+      # conséquence pour ne pas bloquer sur un cache/lockfile inexistant.
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+            echo "Projet Node/Angular détecté."
+          elif [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "Projet Java/Gradle détecté."
+          else
+            echo "::error::Type de projet non reconnu (ni package.json ni Gradle)."
+            exit 1
+          fi
+
+      # Cache npm UNIQUEMENT pour un vrai projet Node (présence d'un lockfile) :
+      # sur un projet Gradle, `cache: npm` échouerait faute de package-lock.json.
+      - name: Configurer Node.js (requis par semantic-release)
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          cache: ${{ steps.detect.outputs.type == 'node' && 'npm' || '' }}
 
-      - name: Installer les dépendances (npm ci)
-        run: npm ci
+      # --- Installation ADAPTATIVE de la chaîne semantic-release -------------
+      # Node   : semantic-release et ses plugins sont des devDependencies -> npm ci.
+      # Gradle : aucun package.json -> on installe la chaîne à la volée, sans
+      #          polluer le dépôt (--no-save).
+      - name: Installer la chaîne de release
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.type }}" = "node" ]; then
+            npm ci
+          else
+            npm install --no-save \
+              semantic-release \
+              @semantic-release/commit-analyzer \
+              @semantic-release/release-notes-generator \
+              @semantic-release/changelog \
+              @semantic-release/exec \
+              @semantic-release/git \
+              @semantic-release/github
+          fi
 
       # semantic-release analyse les commits, calcule la version, crée la
-      # release GitHub + CHANGELOG, bump package.json, et — via le plugin exec —
-      # expose la version calculée dans la sortie d'étape `version`.
+      # release GitHub + CHANGELOG et — via le plugin exec — expose la version
+      # calculée dans la sortie d'étape `version`.
+      #
+      # Config ADAPTATIVE :
+      #  - Node   : on utilise la config du dépôt (.releaserc / clé "release"),
+      #             qui gère le bump de package.json + CHANGELOG.
+      #  - Gradle : le dépôt n'embarque pas de config de release -> on en génère
+      #             une par défaut. Elle bump `version` dans build.gradle (via
+      #             exec/prepareCmd), génère le CHANGELOG.md, committe les deux
+      #             en retour (plugin git) et émet la version pour le re-tag.
       - name: Lancer semantic-release
         id: semantic
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # secret injecté, jamais loggé
-        run: npx semantic-release
+        run: |
+          set -euo pipefail
+          has_config=false
+          for f in .releaserc .releaserc.json .releaserc.yaml .releaserc.yml .releaserc.js .releaserc.cjs release.config.js release.config.cjs; do
+            [ -f "$f" ] && has_config=true && break
+          done
+          if [ "$has_config" = false ] && grep -q '"release"' package.json 2>/dev/null; then
+            has_config=true
+          fi
+
+          if [ "$has_config" = false ]; then
+            echo "Aucune config de release dans le dépôt : génération d'une config par défaut."
+            cat > .releaserc.json <<'EOF'
+          {
+            "branches": ["main"],
+            "plugins": [
+              "@semantic-release/commit-analyzer",
+              "@semantic-release/release-notes-generator",
+              "@semantic-release/changelog",
+              ["@semantic-release/exec", {
+                "verifyReleaseCmd": "echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\"",
+                "prepareCmd": "sed -i -E \"s/^version = .*/version = '${nextRelease.version}'/\" build.gradle"
+              }],
+              ["@semantic-release/git", {
+                "assets": ["build.gradle", "CHANGELOG.md"],
+                "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+              }],
+              "@semantic-release/github"
+            ]
+          }
+          EOF
+          fi
+
+          npx semantic-release
 
       # --- Re-tag de l'image Docker avec la version sémantique --------------
       # Seulement si une nouvelle version a été publiée (sortie non vide).
