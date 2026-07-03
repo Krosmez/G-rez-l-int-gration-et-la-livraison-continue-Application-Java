@@ -1,0 +1,270 @@
+###############################################################################
+# Pipeline CI générique — commun aux deux applications (Angular ET Java/Gradle).
+#
+# Le MÊME fichier fonctionne dans les deux dépôts : une étape de détection
+# identifie le type de projet, puis les étapes suivantes s'activent par
+# condition (`if:`) selon ce type. Le script unifié run-tests.sh exécute les
+# tests et produit un rapport JUnit XML, publié ensuite comme "check" GitHub.
+###############################################################################
+name: CI
+
+on:
+  push:
+    branches: ["**"] # toutes les branches -> permet de tester sur une branche de dev
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # déclenchement manuel
+
+# Permissions minimales (principe du moindre privilège).
+# `checks: write` est requis pour publier le rapport de tests dans l'onglet Checks.
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  packages: write # requis pour pousser l'image vers GitHub Container Registry
+
+# Variables d'environnement centralisées : on adapte les versions ici sans
+# toucher au reste du workflow.
+env:
+  NODE_VERSION: "20.19"
+  JAVA_VERSION: "21"
+  REGISTRY: ghcr.io # GitHub Container Registry
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job de test : s'adapte automatiquement au type de projet.
+  # (Les jobs de build / release viendront s'ajouter dans les étapes suivantes ;
+  #  on garde volontairement une structure en jobs distincts.)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests unitaires
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # --- Détection du type de projet -------------------------------------
+      - name: Détecter le type de projet
+        id: detect
+        run: |
+          if [ -f package.json ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+            echo "Projet Node/Angular détecté."
+          elif [ -f gradlew ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            echo "Projet Java/Gradle détecté."
+          else
+            echo "::error::Type de projet non reconnu (ni package.json ni Gradle)."
+            exit 1
+          fi
+
+      # --- Chaîne Node / Angular (avec cache npm) --------------------------
+      - name: Configurer Node.js
+        if: steps.detect.outputs.type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm # met en cache ~/.npm d'après package-lock.json
+
+      - name: Installer les dépendances (npm ci)
+        if: steps.detect.outputs.type == 'node'
+        run: npm ci
+
+      - name: Installer Chrome (pour Karma ChromeHeadless)
+        if: steps.detect.outputs.type == 'node'
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
+      # --- Chaîne Java / Gradle (avec cache Gradle) ------------------------
+      - name: Configurer le JDK
+        if: steps.detect.outputs.type == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle # met en cache les dépendances Gradle
+
+      # --- Exécution des tests via le script unifié ------------------------
+      - name: Exécuter les tests unitaires
+        env:
+          # Indique à Karma où trouver Chrome (vide et ignoré pour un projet Gradle).
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          chmod +x run-tests.sh
+          ./run-tests.sh
+
+      # --- Publication du rapport de tests dans GitHub ---------------------
+      # `if: always()` : on publie le rapport même si des tests ont échoué.
+      - name: Publier le rapport de tests (JUnit)
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Rapport de tests unitaires
+          path: test-results/**/*.xml
+          reporter: java-junit # format JUnit XML standard (Karma & Gradle)
+          fail-on-error: false
+
+      # Conservation des rapports bruts comme artefact téléchargeable.
+      - name: Archiver les rapports JUnit
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Job de build : construit l'image Docker, la valide (smoke test) puis la
+  # pousse sur GitHub Container Registry, taguée `<branche>-<sha court>`.
+  # Ne s'exécute que si le job de test a réussi (needs: test).
+  # Générique : fonctionne pour tout dépôt disposant d'un Dockerfile à sa racine
+  # (front Angular servi par Nginx comme back Java packagé en jar).
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & push image Docker
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # Configure Buildx (moteur de build moderne + cache).
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # --- Métadonnées d'image : nom (en minuscules) + tag lisible ----------
+      - name: Préparer le nom et le tag de l'image
+        id: meta
+        run: |
+          # GHCR exige un nom d'image entièrement en minuscules.
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          # Nom de branche assaini (les '/' de feature/x deviennent des '-').
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHA_SHORT="${GITHUB_SHA::7}"
+          TAG="${BRANCH}-${SHA_SHORT}"
+          echo "image=${IMAGE}"        >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"            >> "$GITHUB_OUTPUT"
+          echo "ref=${IMAGE}:${TAG}"   >> "$GITHUB_OUTPUT"
+          echo "Image cible : ${IMAGE}:${TAG}"
+
+      # --- Build local (chargé dans le démon pour le smoke test) ------------
+      # push:false + load:true -> l'image reste locale, on la valide AVANT de
+      # publier quoi que ce soit sur le registre.
+      - name: Construire l'image (sans push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- Point de vigilance : valider que l'image est fonctionnelle -------
+      # Smoke test générique : le conteneur doit démarrer et rester vivant
+      # (détecte un crash au boot, panne la plus fréquente). Pas de dépendance
+      # à un port applicatif précis -> valable pour Nginx comme pour un jar.
+      - name: Smoke test de l'image
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke-test "${{ steps.meta.outputs.ref }}"
+          sleep 5
+          if [ "$(docker inspect -f '{{.State.Running}}' smoke-test)" != "true" ]; then
+            echo "::error::Le conteneur s'est arrêté prématurément."
+            docker logs smoke-test
+            exit 1
+          fi
+          echo "Conteneur opérationnel."
+          docker rm -f smoke-test
+
+      # --- Connexion à GHCR (uniquement hors pull_request) ------------------
+      # On ne publie pas depuis une PR (le GITHUB_TOKEN d'une PR de fork n'a pas
+      # les droits packages) : les PR se contentent de builder + tester l'image.
+      - name: Se connecter à GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # secret injecté, jamais loggé
+
+      # --- Push de l'image validée -----------------------------------------
+      - name: Pousser l'image sur GHCR
+        if: github.event_name != 'pull_request'
+        run: docker push "${{ steps.meta.outputs.ref }}"
+
+      - name: Récapitulatif
+        if: github.event_name != 'pull_request'
+        run: echo "Image publiée -> ${{ steps.meta.outputs.ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job de release : versioning automatique via semantic-release (Conventional
+  # Commits) -> release GitHub + CHANGELOG + bump de version dans les fichiers,
+  # puis re-tag de l'image Docker déjà publiée avec la version sémantique.
+  #
+  # Déclenchement : uniquement sur un push/merge de la branche main (pas de
+  # release depuis une PR ou une branche de dev).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release & tag sémantique
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Permissions spécifiques au job (le moindre privilège ailleurs) :
+    # semantic-release doit écrire tags/commit/release et republier l'image.
+    permissions:
+      contents: write # créer tags, release GitHub et pousser le commit de version
+      issues: write # commenter les issues liées
+      pull-requests: write # commenter les PR liées
+      packages: write # re-taguer l'image sur GHCR
+
+    steps:
+      # fetch-depth: 0 -> semantic-release a besoin de tout l'historique + tags.
+      - name: Récupérer le code (historique complet)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Installer les dépendances (npm ci)
+        run: npm ci
+
+      # semantic-release analyse les commits, calcule la version, crée la
+      # release GitHub + CHANGELOG, bump package.json, et — via le plugin exec —
+      # expose la version calculée dans la sortie d'étape `version`.
+      - name: Lancer semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # secret injecté, jamais loggé
+        run: npx semantic-release
+
+      # --- Re-tag de l'image Docker avec la version sémantique --------------
+      # Seulement si une nouvelle version a été publiée (sortie non vide).
+      - name: Se connecter à GitHub Container Registry
+        if: steps.semantic.outputs.version != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On ne reconstruit pas : on ajoute les tags `x.y.z` et `latest` sur
+      # l'image exacte déjà buildée et testée par le job `build` (main-<sha>).
+      - name: Taguer l'image avec la version sémantique
+        if: steps.semantic.outputs.version != ''
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          SOURCE="${IMAGE}:main-${GITHUB_SHA::7}"
+          VERSION="${{ steps.semantic.outputs.version }}"
+          docker buildx imagetools create "$SOURCE" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest"
+          echo "Image taguée -> ${IMAGE}:${VERSION} (+ latest)" >> "$GITHUB_STEP_SUMMARY"
