@@ -1,15 +1,49 @@
-# Build artifacts & caches (rebuilt inside the image)
+# Build artifacts & caches Gradle (reconstruits dans l'image)
 build/
 .gradle/
+bin/
+out/
+!gradle/wrapper/gradle-wrapper.jar
 
-# Version control & IDE
+# Fichiers générés OpenAPI
+.openapi-generator/
+java-generated/
+
+# Version control
 .git/
 .gitignore
+
+# IDE / éditeurs
 .idea/
 *.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+.springBeans
+.sts4-cache/
+.apt_generated/
 
-# Docker / k8s tooling (not needed at build time)
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# CI GitHub Actions (workflows + artefacts éventuels, inutiles au build)
+.github/
+*.sarif
+*.log
+*.exec
+
+# Docker / k8s tooling (inutile au build de l'image)
 docker-compose.yml
+Dockerfile
+.dockerignore
 k8s/
 
 # Misc
